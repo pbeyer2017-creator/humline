@@ -308,51 +308,127 @@ function makeInstrument(key,out){
   return {play(p,d,time,v){syn.triggerAttackRelease(Tone.Frequency(p,'midi').toFrequency(),d,time,v)},dispose(){chain.forEach(x=>x.dispose())}};
 }
 
-/* ---------- playback ---------- */
-function buildPlayback({capture=false,offline=false}={}){
-  const tr=Tone.getTransport();
-  const bag=offline?[]:live;
-  if(!offline){tr.cancel();clearLive()}
-  tr.bpm.value=S.bpm;
-  tr.loop=!capture&&!offline; tr.loopStart=0; tr.loopEnd=`${S.bars}m`;
-  const anySolo=S.tracks.some(t=>t.solo);
-  // master bus: headroom + limiter so layered tracks never clip (clipping sounds grainy)
-  const shaper=new Tone.WaveShaper(x=>Math.tanh(x*.9),2048).toDestination(), limiter=new Tone.Limiter(-3).connect(shaper), master=new Tone.Gain(.6).connect(limiter); bag.push(master,limiter,shaper);
-  if(!offline) liveGain={};
-  for(const t of S.tracks){
-    if(t.mute||(anySolo&&!t.solo)) continue;
-    if(t.notes.length&&t.synthGain>0){
-      const out=new Tone.Gain(t.synthGain).connect(master); bag.push(out); if(!offline)(liveGain[t.id]=liveGain[t.id]||{}).syn=out;
-      const inst=makeInstrument(t.instrument,out); bag.push(inst);
-      const part=new Tone.Part((time,n)=>{try{inst.play(n[2]+(t.instrument==='drums'?0:t.tr),n[1]*stepSec(),time,n[3])}catch(e){}},t.notes.map(n=>[`${n[0]*STEP_TICKS}i`,n])).start(0);
-      bag.push(part);
-    }
-    const ab=AUDIO[t.id];
-    if(ab&&t.origGain>0){
-      const g=new Tone.Gain(t.origGain).connect(master); bag.push(g); if(!offline)(liveGain[t.id]=liveGain[t.id]||{}).orig=g;
-      for(const off of (t.rep||[0])){
-        const p=new Tone.Player(ab).connect(g); p.playbackRate=S.bpm/t.capBpm; bag.push(p);
-        const start=(t.at+off)*16*stepSec()+t.nudge/1000;
-        p.sync().start(Math.max(0,start),Math.max(0,-start));
+/* ---------- playback (v0.4.1: one fail-safe rebuild path) ----------
+   Every path (Play, edits while playing, undo, arrange buttons) builds audio through buildGraph().
+   A new graph is built completely BEFORE the old one is torn down, so a failed build leaves the
+   previous sound playing instead of silence. Notes are sanitized before scheduling. */
+const MONO=new Set(['bass','sub']);
+const HL={lastError:null,errors:0,rebuilds:0,failures:0,dropped:0,callbackErrors:0};
+function noteErr(where,e){const m=(e&&e.message)||String(e);HL.lastError=`${where}: ${m}`.slice(0,160);HL.errors++;try{console.error('[humline]',where,e)}catch(_){}}
+function drumVoice(p){return p<=37?'k':p<=40?'s':p===46?'o':p>=49?'c':'h'}
+// Make a track's notes safe to schedule: finite numbers, whole steps, length >= 1 step, inside the song,
+// no duplicates, and one note per start time on single-voice instruments.
+function cleanNotes(t){
+  const T=total(), out=[], seen=new Set(), drums=t.instrument==='drums'; let drop=0;
+  for(const n of (Array.isArray(t.notes)?t.notes:[])){
+    if(!Array.isArray(n)){drop++;continue}
+    const s=Math.round(+n[0]), p=Math.round(+n[2]); let d=Math.round(+n[1]), v=+n[3];
+    if(!Number.isFinite(s)||!Number.isFinite(p)||s<0||s>=T){drop++;continue}
+    if(!Number.isFinite(d)||d<1)d=1; d=Math.min(d,T-s);
+    if(!Number.isFinite(v)||v<=0)v=.8; v=clamp(v,.05,1);
+    const pp=p+(drums?0:(Math.round(+t.tr)||0)); if(pp<0||pp>127){drop++;continue}
+    const key=drums?s+drumVoice(p):MONO.has(t.instrument)?String(s):s+':'+pp;
+    if(seen.has(key)){drop++;continue} seen.add(key);
+    out.push([s,d,pp,v]);
+  }
+  out.sort((a,b)=>a[0]-b[0]);
+  return {notes:out,drop};
+}
+function disposeAll(bag){for(const x of bag){try{x.dispose()}catch(e){}}}
+function buildGraph({capture=false,offline=false}={}){
+  const tr=Tone.getTransport(), bag=[], gains={}; let drop=0;
+  try{
+    const bpm=Number.isFinite(+S.bpm)?clamp(+S.bpm,40,220):96, bars=Math.max(1,Math.round(+S.bars)||4);
+    tr.bpm.value=bpm; tr.loop=!capture&&!offline; tr.loopStart=0; tr.loopEnd=`${bars}m`;
+    const anySolo=S.tracks.some(t=>t.solo);
+    // master bus: headroom + limiter so layered tracks never clip (clipping sounds grainy)
+    const shaper=new Tone.WaveShaper(x=>Math.tanh(x*.9),2048).toDestination(), limiter=new Tone.Limiter(-3).connect(shaper), master=new Tone.Gain(.6).connect(limiter); bag.push(master,limiter,shaper);
+    for(const t of S.tracks){
+      if(t.mute||(anySolo&&!t.solo)) continue;
+      const c=cleanNotes(t); drop+=c.drop;
+      const sg=Number.isFinite(+t.synthGain)?+t.synthGain:.8, og=Number.isFinite(+t.origGain)?+t.origGain:.8;
+      if(c.notes.length&&sg>0){
+        const out=new Tone.Gain(sg).connect(master); bag.push(out); (gains[t.id]=gains[t.id]||{}).syn=out;
+        const inst=makeInstrument(t.instrument,out); bag.push(inst);
+        const part=new Tone.Part((time,n)=>{try{inst.play(n[2],n[1]*stepSec(),time,n[3])}catch(e){HL.callbackErrors++;noteErr('note',e)}},c.notes.map(n=>[`${n[0]*STEP_TICKS}i`,n])).start(0);
+        bag.push(part);
+      }
+      const ab=AUDIO[t.id];
+      if(ab&&og>0){
+        const g=new Tone.Gain(og).connect(master); bag.push(g); (gains[t.id]=gains[t.id]||{}).orig=g;
+        const rate=S.bpm/(+t.capBpm||S.bpm);
+        for(const off of (Array.isArray(t.rep)&&t.rep.length?t.rep:[0])){
+          const start=((+t.at||0)+(+off||0))*16*stepSec()+(+t.nudge||0)/1000;
+          if(!Number.isFinite(start)) continue;
+          const p=new Tone.Player(ab).connect(g); p.playbackRate=Number.isFinite(rate)&&rate>0?rate:1; bag.push(p);
+          p.sync().start(Math.max(0,start),Math.max(0,-start));
+        }
       }
     }
-  }
+  }catch(e){disposeAll(bag);throw e}
+  HL.dropped=drop; if(drop) console.warn(`[humline] skipped ${drop} unplayable note(s)`);
+  return {bag,gains};
 }
-function clearLive(){live.forEach(x=>{try{x.dispose()}catch(e){}});live=[];liveGain={}}
+// swap a freshly built graph in, then dispose the old one
+function swapIn(g){const old=live; live=g.bag; liveGain=g.gains; disposeAll(old)}
+function clearLive(){swapIn({bag:[],gains:{}})}
+// kept for recording (capture) and export (offline) callers
+function buildPlayback(opts={}){const g=buildGraph(opts); if(!opts.offline) swapIn(g); return g}
 // change a volume in place while playing (no rebuild); returns false if a rebuild is needed
-function setLiveGain(t,kind){const g=liveGain[t.id]&&liveGain[t.id][kind]; if(!g)return false; g.gain.rampTo(kind==='syn'?t.synthGain:t.origGain,.03); return true}
+function setLiveGain(t,kind){const g=liveGain[t.id]&&liveGain[t.id][kind]; if(!g)return false; try{g.gain.rampTo(kind==='syn'?t.synthGain:t.origGain,.03);return true}catch(e){return false}}
+function playFail(e,where){HL.failures++;noteErr(where,e);status(`Playback hit a problem (${(e&&e.message)||e}). Press Stop, then Play. If it keeps happening, press Send feedback.`,'err')}
+async function ensureContext(){
+  try{await Tone.start()}catch(e){}
+  const ctx=Tone.getContext();
+  if(ctx.state!=='running'){try{await ctx.rawContext.resume()}catch(e){}}
+  return Tone.getContext().state==='running';
+}
+let refreshTimer=null, playGen=0;
 async function play(){
-  await Tone.start();
-  buildPlayback(); const tr=Tone.getTransport(); tr.position=0; tr.start('+0.05');
+  const gen=++playGen; clearTimeout(refreshTimer);
+  const ok=await ensureContext();
+  if(gen!==playGen) return;               // Stop (or another Play) happened while waiting
+  if(!ok){status('Chrome has paused sound for this page. Click anywhere on the page, then press Play again.','err');return}
+  const tr=Tone.getTransport(); tr.stop(); tr.cancel(0); clearLive(); tr.position=0;   // hard reset every Play
+  try{swapIn(buildGraph())}catch(e){playFail(e,'play');return}
+  tr.start('+0.05'); HL.rebuilds++;
   playing=true; document.body.classList.add('playing'); $('#playBtn').textContent='Stop'; $('#playBtn').setAttribute('aria-pressed','true');
+  if($('#status').classList.contains('err')&&/^Playback|^Chrome has paused/.test($('#status').textContent)) status('');
 }
 function stop(){
-  const tr=Tone.getTransport(); tr.stop(); tr.cancel(); clearLive();
+  playGen++; clearTimeout(refreshTimer);
+  const tr=Tone.getTransport(); tr.stop(); tr.cancel(0); clearLive();
   playing=false; document.body.classList.remove('playing'); $('#playBtn').textContent='Play'; $('#playBtn').setAttribute('aria-pressed','false');
 }
-let refreshTimer=null;
-function refresh(){ if(!playing) return; clearTimeout(refreshTimer); refreshTimer=setTimeout(()=>{
-  const tr=Tone.getTransport(); const pos=tr.ticks%(total()*STEP_TICKS); tr.stop(); buildPlayback(); tr.start('+0.03',`${pos}i`);},120);}
+// edits while stopped only change the song; the next Play rebuilds from scratch.
+// edits while playing rebuild once things settle (debounced), keeping the play position.
+function refresh(){ if(!playing) return; clearTimeout(refreshTimer); refreshTimer=setTimeout(liveRebuild,120) }
+function liveRebuild(){
+  if(!playing||recording) return;
+  const tr=Tone.getTransport(), loopT=Math.max(1,total()*STEP_TICKS);
+  let pos=Math.floor(tr.ticks); pos=Number.isFinite(pos)?((pos%loopT)+loopT)%loopT:0;
+  let g; try{g=buildGraph()}catch(e){playFail(e,'edit');return}   // old sound keeps going
+  tr.stop(); swapIn(g); tr.start('+0.03',`${pos}i`); HL.rebuilds++;
+  if(Tone.getContext().state!=='running') ensureContext();
+}
+// keep the audio engine awake: Chrome can suspend it when the tab is hidden or idle
+function watchContext(){
+  if(!playing) return;
+  if(Tone.getContext().state!=='running') ensureContext().then(ok=>{if(!ok&&playing)status('Sound paused. Click anywhere on the page to bring it back.','err')});
+}
+try{Tone.getContext().rawContext.addEventListener('statechange',watchContext)}catch(e){}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)watchContext()});
+document.addEventListener('pointerdown',()=>{if(playing&&Tone.getContext().state!=='running')ensureContext().then(ok=>ok&&status(''))},true);
+window.addEventListener('error',e=>noteErr('page',e.error||e.message));
+window.addEventListener('unhandledrejection',e=>noteErr('async',e.reason));
+function diag(){
+  let ctx='?',trs='?',pos='?';try{ctx=Tone.getContext().state;const tr=Tone.getTransport();trs=tr.state;pos=tr.position}catch(e){}
+  return {context:ctx,transport:trs,position:String(pos),playing,liveNodes:live.length,
+    tracks:S.tracks.map(t=>({name:t.name,instrument:t.instrument,notes:(t.notes||[]).length,playable:cleanNotes(t).notes.length,mute:!!t.mute,solo:!!t.solo,vol:t.synthGain})),
+    rebuilds:HL.rebuilds,failures:HL.failures,dropped:HL.dropped,callbackErrors:HL.callbackErrors,lastError:HL.lastError};
+}
+window.__hl=diag;
+function diagLine(){const d=diag();return `Tech: sound ${d.context}, transport ${d.transport}, playing ${d.playing}, nodes ${d.liveNodes}, rebuilds ${d.rebuilds}, failures ${d.failures}, skipped notes ${d.dropped}, note errors ${d.callbackErrors}, last error ${d.lastError||'none'}\nParts: ${d.tracks.map(t=>`${t.name}/${t.instrument} ${t.playable}/${t.notes}${t.mute?' muted':''}${t.solo?' solo':''} vol ${t.vol}`).join('; ')}\nBrowser: ${navigator.userAgent.replace(/^Mozilla\/5\.0 /,'').slice(0,90)}`}
 let heads=[];
 (function tick(){
   if(playing||recording){const tr=Tone.getTransport(); const frac=(tr.ticks/(total()*STEP_TICKS))%1;
@@ -848,7 +924,7 @@ function zip(files){
 }
 
 /* ================= Dad build additions ================= */
-const VERSION='Test version 0.4';
+const VERSION='Test version 0.4.1';
 const FEEDBACK_TO=''; // optional: an address to pre-fill in feedback emails
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const SRC_LABEL={singing:'voice',steady:'voice',guitar:'guitar',bass:'bass'};
@@ -1092,13 +1168,13 @@ $('#helpClose').onclick=()=>{helpDlg.close(); try{localStorage.setItem('humline-
 helpDlg.addEventListener('close',()=>{try{localStorage.setItem('humline-welcomed','1')}catch(e){}});
 function feedbackText(){
   const tr=S.tracks.map(t=>`${t.name} (${(INSTR[t.instrument]||{}).label||t.instrument}${t.origin==='captured'?', own take':''})`).join('; ')||'none';
-  return `Humline ${VERSION} notes\n\nWhat I liked:\n${$('#fb1').value.trim()||'-'}\n\nConfusing, broken, or sounded wrong:\n${$('#fb2').value.trim()||'-'}\n\nWhat I wish it could do:\n${$('#fb3').value.trim()||'-'}\n\n---\nSong: ${S.bars} bars, ${S.bpm} bpm, ${keyName()}, feel ${feel()}\nTracks: ${tr}\nBrowser: ${navigator.userAgent}`;
+  return `Humline ${VERSION} notes\n\nWhat I liked:\n${$('#fb1').value.trim()||'-'}\n\nConfusing, broken, or sounded wrong:\n${$('#fb2').value.trim()||'-'}\n\nWhat I wish it could do:\n${$('#fb3').value.trim()||'-'}\n\n---\nSong: ${S.bars} bars, ${S.bpm} bpm, ${keyName()}, feel ${feel()}\nTracks: ${tr}\n${diagLine()}`;
 }
 $('#feedbackBtn').onclick=()=>{$('#fbDone').textContent=''; fbDlg.showModal()};
 $('#fbCancel').onclick=()=>fbDlg.close();
 $('#fbCopy').onclick=async()=>{try{await navigator.clipboard.writeText(feedbackText()); $('#fbDone').textContent='Copied. Paste it into an email.'}catch(e){$('#fbDone').textContent='Copy was blocked. Select the text in the boxes and copy it by hand.'}};
 $('#fbSend').onclick=()=>{
-  const body=feedbackText().slice(0,1800);
+  const full=feedbackText(), cut=full.indexOf('\n---\n'); const tech=full.slice(cut); const body=full.length<=1800?full:full.slice(0,Math.max(200,1800-tech.length))+'…'+tech; // keep the tech lines even when the notes are long
   location.href=`mailto:${encodeURIComponent(FEEDBACK_TO)}?subject=${encodeURIComponent('Humline notes')}&body=${encodeURIComponent(body)}`;
   $('#fbDone').textContent='If no email window opened, press Copy notes and paste them into an email instead.';
 };
