@@ -305,7 +305,15 @@ function makeInstrument(key,out){
   let made=(INSTR[key]||INSTR.lead).make(); let chain=Array.isArray(made)?made:[made];
   chain.reduce((a,b)=>{a.connect(b);return b}).connect(out);
   const syn=chain[0]; if('maxPolyphony' in syn) syn.maxPolyphony=14;
-  return {play(p,d,time,v){syn.triggerAttackRelease(Tone.Frequency(p,'midi').toFrequency(),d,time,v)},dispose(){chain.forEach(x=>x.dispose())}};
+  // v0.4.2: a bare triangle with no sustain all but vanishes below ~E3 on laptop speakers (they cut <150 Hz).
+  // Low Pluck notes go to a brighter, slightly sustained voice whose harmonics carry the pitch.
+  if(key==='pluck'){
+    const lp=new Tone.Filter(2400,'lowpass').connect(out);
+    const low=new Tone.PolySynth(Tone.Synth,{oscillator:{type:'sawtooth'},envelope:{attack:.003,decay:.45,sustain:.25,release:.25}}).connect(lp);
+    low.maxPolyphony=14; low.volume.value=-4; chain.push(low,lp);
+  }
+  const lowSyn=key==='pluck'?chain[chain.length-2]:null;
+  return {play(p,d,time,v){(lowSyn&&p<52?lowSyn:syn).triggerAttackRelease(Tone.Frequency(p,'midi').toFrequency(),d,time,v)},dispose(){chain.forEach(x=>x.dispose())}};
 }
 
 /* ---------- playback (v0.4.1: one fail-safe rebuild path) ----------
@@ -924,7 +932,7 @@ function zip(files){
 }
 
 /* ================= Dad build additions ================= */
-const VERSION='Test version 0.4.1';
+const VERSION='Test version 0.4.2';
 const FEEDBACK_TO=''; // optional: an address to pre-fill in feedback emails
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const SRC_LABEL={singing:'voice',steady:'voice',guitar:'guitar',bass:'bass'};
